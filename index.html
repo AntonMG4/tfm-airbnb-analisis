@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TFM Airbnb · Código del análisis</title>
+<style>
+  :root {
+    --granate: #8b1521;
+    --granate-claro: #f6eced;
+    --texto: #222;
+    --texto-suave: #666;
+    --borde: #e3d6d8;
+    --fondo: #fff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--fondo);
+    color: var(--texto);
+    font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.5;
+  }
+  header {
+    background: var(--granate);
+    color: #fff;
+    padding: 48px 16px 40px;
+  }
+  .contenedor { max-width: 860px; margin: 0 auto; padding: 0 16px; }
+  header .contenedor { padding: 0; }
+  .etiqueta {
+    font-size: 13px; letter-spacing: .08em; text-transform: uppercase;
+    opacity: .8; margin: 0 0 8px;
+  }
+  h1 { font-size: 30px; line-height: 1.2; margin: 0 0 12px; }
+  .autor { margin: 0; opacity: .9; font-size: 15px; }
+  main.contenedor { padding: 36px 16px 56px; }
+  h2 { font-size: 20px; margin: 0 0 6px; }
+  .intro { color: var(--texto-suave); margin: 0 0 24px; }
+  .documentos { list-style: none; padding: 0; margin: 0; display: grid; gap: 14px; }
+  .documentos a {
+    display: flex; gap: 18px; align-items: flex-start;
+    padding: 18px 20px; border: 1px solid var(--borde); border-left: 5px solid var(--granate);
+    border-radius: 8px; text-decoration: none; color: inherit;
+    transition: background .15s, box-shadow .15s;
+  }
+  .documentos a:hover { background: var(--granate-claro); box-shadow: 0 2px 10px rgba(139,21,33,.08); }
+  .numero {
+    flex: none; width: 36px; height: 36px; border-radius: 50%;
+    background: var(--granate); color: #fff; font-weight: 700;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .titulo { font-weight: 700; margin: 0 0 2px; }
+  .nombre { font-family: Consolas, Menlo, monospace; font-size: 13px; color: var(--granate); }
+  .descripcion { margin: 4px 0 0; color: var(--texto-suave); font-size: 15px; }
+  .enlaces { margin-top: 36px; padding-top: 24px; border-top: 1px solid var(--borde); }
+  .enlaces ul { padding-left: 18px; margin: 8px 0 0; }
+  .enlaces a { color: var(--granate); }
+  @media (max-width: 520px) {
+    h1 { font-size: 24px; }
+    .documentos a { gap: 12px; padding: 14px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="contenedor">
+    <p class="etiqueta">Trabajo Fin de Máster · Universidad de Sevilla</p>
+    <h1>Sistema de optimización de precios y segmentación de mercado en Airbnb</h1>
+    <p class="autor">Antón Maestre Gómez · Máster en Data Science y Big Data</p>
+  </div>
+</header>
+<main class="contenedor">
+  <h2>Documentos del análisis</h2>
+  <p class="intro">Se recomienda leerlos en este orden, que coincide con el orden de ejecución: cada uno utiliza los ficheros generados por el anterior.</p>
+  <ul class="documentos">
+    <li><a href="TFM_Airbnb_ETL.html">
+      <span class="numero">1</span>
+      <span><p class="titulo">ETL de alojamientos <span class="nombre">TFM_Airbnb_ETL</span></p>
+      <p class="descripcion">Limpieza de los alojamientos, conversión a euros, detección de precios sospechosos, tratamiento de nulos y variables de comodidades.</p></span>
+    </a></li>
+    <li><a href="TFM_Reviews_ETL.html">
+      <span class="numero">2</span>
+      <span><p class="titulo">ETL de reseñas <span class="nombre">TFM_Reviews_ETL</span></p>
+      <p class="descripcion">Deduplicación e integridad de las reseñas, evolución temporal y estacionalidad.</p></span>
+    </a></li>
+    <li><a href="TFM_Clustering.html">
+      <span class="numero">3</span>
+      <span><p class="titulo">Segmentación del mercado <span class="nombre">TFM_Clustering</span></p>
+      <p class="descripcion">PCA de las reseñas, selección de variables, clustering en dos niveles e Isolation Forest.</p></span>
+    </a></li>
+    <li><a href="TFM_ModeloPrecio.html">
+      <span class="numero">4</span>
+      <span><p class="titulo">Modelo de precio <span class="nombre">TFM_ModeloPrecio</span></p>
+      <p class="descripcion">Variable objetivo, XGBoost y Random Forest, evaluación, importancia de variables, rango de referencia y exportación a la aplicación.</p></span>
+    </a></li>
+  </ul>
+  <div class="enlaces">
+    <h2>Enlaces relacionados</h2>
+    <ul>
+      <li><a href="https://github.com/AntonMG4/tfm-airbnb-analisis">Repositorio con el código fuente (.qmd)</a></li>
+      <li><a href="https://antonmg-recomendador-precio-app.hf.space">Aplicación web de recomendación de precio</a></li>
+      <li><a href="https://github.com/AntonMG4/tfm-precio-app">Código de la aplicación web</a></li>
+    </ul>
+  </div>
+</main>
+</body>
+</html>
