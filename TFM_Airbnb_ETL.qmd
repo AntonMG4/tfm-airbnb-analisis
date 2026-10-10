@@ -1,0 +1,704 @@
+---
+title: "TFM - Sistema de optimización de precios y segmentación de mercado en Airbnb"
+subtitle: "Fase ETL: extracción, transformación y carga de datos - listings.csv"
+author: "Antón Maestre Gómez"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    theme: cosmo
+execute:
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+
+library(tidyverse)
+library(naniar)
+library(skimr)
+library(jsonlite)
+```
+
+# Introducción
+
+Este documento recoge la fase de ETL (Extracción, Transformación y Carga) del dataset de
+Airbnb (2008-2021) proporcionado para el TFM. El objetivo de esta fase es dejar un
+conjunto de datos limpio, documentado y listo para las fases posteriores de clustering
+y modelado predictivo de precio.
+
+A lo largo del documento no solo se aplican las transformaciones, sino que se documenta
+el razonamiento y la evidencia que llevó a cada decisión — muchas hipótesis iniciales
+(basadas en la documentación genérica del dataset) se contrastaron con los datos reales
+y se revisaron cuando la evidencia no las respaldaba. Esa validación empírica es en sí
+misma parte del valor de esta fase.
+
+# 1. Carga y EDA inicial
+
+## 1.1 Carga de datos
+
+```{r}
+#| label: carga
+
+listings <- read_csv("data/listings.csv", show_col_types = FALSE)
+```
+
+## 1.2 Estructura general
+
+```{r}
+#| label: estructura
+
+glimpse(listings)
+skim(listings)
+```
+
+El dataset contiene **279.712 filas y 33 columnas**, en línea con lo indicado en la
+documentación del dataset (~250 mil registros).
+
+## 1.3 Valores ausentes
+
+```{r}
+#| label: missingness-inicial
+#| fig-cap: "Valores ausentes por variable (dataset original)"
+#| fig-width: 9
+#| fig-height: 10
+
+miss_var_summary(listings) %>% print(n = Inf)
+
+gg_miss_var(listings) +
+  labs(title = "Valores ausentes por variable (antes de limpieza)")
+
+vis_miss(listings, warn_large_data = FALSE) +
+  theme(plot.margin = margin(t = 40, r = 10, b = 10, l = 10))
+```
+
+Variables con mayor proporción de nulos: `district` (86,8%), `host_response_time`/
+`host_response_rate` (46,0%), `host_acceptance_rate` (40,4%), los 6 `review_scores_*`
+más `review_scores_rating` (~32,7-32,8%), y `bedrooms` (10,5%).
+
+## 1.4 Variables geográficas: auditoría de inconsistencias
+
+La documentación original del dataset advierte de inconsistencias geográficas
+(distinta granularidad y distinta nomenclatura para un mismo lugar). Antes de construir
+cualquier proceso de limpieza, se comprobó si esos problemas están realmente presentes
+en este dataset en concreto.
+
+```{r}
+#| label: geo-cardinalidad
+
+listings %>%
+  summarise(
+    n_city = n_distinct(city, na.rm = TRUE),
+    n_district = n_distinct(district, na.rm = TRUE),
+    n_neighbourhood = n_distinct(neighbourhood, na.rm = TRUE)
+  )
+
+listings %>%
+  count(city, sort = TRUE) %>%
+  print(n = 50)
+```
+
+**Hallazgo:** el dataset contiene únicamente **10 ciudades** (Paris, New York, Sydney,
+Rome, Rio de Janeiro, Istanbul, Mexico City, Bangkok, Cape Town, Hong Kong), sin
+ninguna variante de nomenclatura ni valores ausentes en `city`. Es un dataset ya
+curado a estas 10 ciudades, a diferencia del dataset global de Kaggle que describe la
+documentación genérica.
+
+```{r}
+#| label: geo-district
+
+listings %>%
+  filter(!is.na(district)) %>%
+  count(district, city, sort = TRUE)
+```
+
+`district` solo está poblado para **New York** (sus 5 distritos administrativos), sin
+ambigüedad: `city` ya identifica esas filas como "New York" de forma consistente.
+Se conserva como variable auxiliar opcional, no requiere limpieza.
+
+```{r}
+#| label: geo-neighbourhood
+
+listings %>%
+  distinct(city, neighbourhood) %>%
+  count(city, sort = TRUE)
+
+# Duplicados por normalización de texto (minúsculas + trim)
+listings %>%
+  distinct(neighbourhood) %>%
+  mutate(neighbourhood_norm = str_to_lower(str_trim(neighbourhood))) %>%
+  count(neighbourhood_norm, sort = TRUE) %>%
+  filter(n > 1)
+
+# Neighbourhoods que aparecen en más de una ciudad
+listings %>%
+  distinct(city, neighbourhood) %>%
+  count(neighbourhood, sort = TRUE) %>%
+  filter(n > 1)
+```
+
+**Conclusión de la auditoría geográfica:** `city`, `district` y `neighbourhood` están
+limpios (0 duplicados de texto, 0 solapamientos entre ciudades). **No es necesario
+ningún proceso de normalización geográfica ni geocoding por coordenadas** — se evaluó
+como estrategia (uniones espaciales con `sf`/`rnaturalearth` para resolver país/región/
+ciudad a partir de `latitude`/`longitude`) pero se descartó por sobreingeniería una vez
+comprobado que el problema que pretendía resolver no está presente en estos datos.
+
+## 1.5 Distribución de `price` (sin normalizar moneda)
+
+```{r}
+#| label: price-crudo
+#| fig-cap: "Distribución de price en moneda local (escala log)"
+
+listings %>%
+  summarise(
+    n = n(),
+    n_price_na = sum(is.na(price)),
+    n_price_zero_o_negativo = sum(price <= 0, na.rm = TRUE),
+    min = min(price, na.rm = TRUE),
+    max = max(price, na.rm = TRUE),
+    mediana = median(price, na.rm = TRUE)
+  )
+
+ggplot(listings %>% filter(price > 0), aes(x = price)) +
+  geom_histogram(bins = 100) +
+  scale_x_log10() +
+  labs(title = "Distribución de price (escala log, sin normalizar moneda)",
+       x = "price (moneda local, log)", y = "nº de listings")
+```
+
+`price` está en la moneda local de cada país, por lo que **no es comparable entre
+ciudades todavía** — se resuelve en la sección 2 (conversión de moneda).
+
+## 1.6 Perfilado de `amenities`
+
+```{r}
+#| label: amenities-perfil
+
+listings %>% pull(amenities) %>% head(5)
+```
+
+`amenities` es un string en formato JSON (lista de amenities entre corchetes). Se
+parsea en detalle en la sección 4.
+
+## 1.7 Otras variables clave
+
+```{r}
+#| label: otras-variables
+
+listings %>% count(property_type, sort = TRUE) %>% print(n = 30)
+listings %>% count(room_type, sort = TRUE)
+```
+
+# 2. Conversión de moneda
+
+Dado que solo hay 10 ciudades (sección 1.4), se construye una tabla de mapeo manual
+ciudad → país → moneda → tipo de cambio, en vez de inferir el país mediante coordenadas
+(innecesario para solo 10 valores conocidos).
+
+**Fuente de los tipos de cambio:** European Central Bank, *Euro foreign exchange
+reference rates*, 31 de agosto de 2026.
+<https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml>
+
+```{r}
+#| label: currency-map
+
+currency_map <- tribble(
+  ~city,            ~country,        ~currency, ~rate_to_eur,
+  "Paris",          "France",        "EUR",     1,
+  "Rome",           "Italy",         "EUR",     1,
+  "New York",       "United States", "USD",     1/1.1596,
+  "Sydney",         "Australia",     "AUD",     1/1.6191,
+  "Rio de Janeiro", "Brazil",        "BRL",     1/5.9972,
+  "Istanbul",       "Turkey",        "TRY",     1/55.9648,
+  "Mexico City",    "Mexico",        "MXN",     1/19.7228,
+  "Bangkok",        "Thailand",      "THB",     1/38.458,
+  "Cape Town",      "South Africa",  "ZAR",     1/18.6885,
+  "Hong Kong",      "Hong Kong",     "HKD",     1/9.0888
+)
+
+listings <- listings %>%
+  filter(price > 0) %>%
+  left_join(currency_map, by = "city") %>%
+  mutate(price_eur = price * rate_to_eur) %>%
+  select(-country, -currency, -rate_to_eur)
+
+summary(listings$price_eur)
+```
+
+El `filter(price > 0)` descarta aquí los 113 listings con `price = 0` ya detectados en
+la sección 1.5 (`n_price_zero_o_negativo`) — un precio de 0 no es un precio de mercado
+real y no tiene sentido convertirlo de moneda. No hay ningún caso negativo. El dataset
+pasa así de 279.712 a 279.599 filas, la cifra que aparece de aquí en adelante.
+
+```{r}
+#| label: price-eur-por-ciudad
+#| fig-cap: "Distribución de price_eur por ciudad (escala log)"
+#| fig-width: 8
+#| fig-height: 6
+
+listings %>%
+  group_by(city) %>%
+  summarise(
+    n = n(),
+    mediana_eur = median(price_eur),
+    p95_eur = quantile(price_eur, 0.95),
+    max_eur = max(price_eur)
+  ) %>%
+  arrange(desc(max_eur))
+
+ggplot(listings, aes(x = reorder(city, price_eur, FUN = median), y = price_eur)) +
+  geom_boxplot(outlier.alpha = 0.2) +
+  scale_y_log10() +
+  coord_flip() +
+  labs(title = "Distribución de price_eur por ciudad (escala log)",
+       x = NULL, y = "price_eur (log)")
+```
+
+## 2.1 Detección de outliers de precio
+
+Al observar los precios más altos ya convertidos a EUR, varios de ellos combinan un
+precio desproporcionado con ausencia de reseñas (`review_scores_rating` NA). Antes de
+definir un criterio de outlier, se comprueba con un umbral exploratorio fijo si ese
+patrón (precio extremo + sin reviews) es general en las 10 ciudades o un caso aislado:
+
+```{r}
+#| label: diagnostico-precio-extremo
+
+listings %>%
+  filter(price_eur > 2000) %>%
+  group_by(city) %>%
+  summarise(
+    n_extremos = n(),
+    pct_sin_reviews = mean(is.na(review_scores_rating)) * 100
+  ) %>%
+  arrange(desc(n_extremos))
+
+listings %>%
+  filter(price_eur <= 2000) %>%
+  summarise(pct_sin_reviews = mean(is.na(review_scores_rating)) * 100)
+```
+
+El contraste es claro: **32,6% de los listings sin reviews en el conjunto general
+(`price_eur <= 2000`), frente a un 33%-87,5% dentro del grupo de precios extremos**
+(`price_eur > 2000`), y presente en las 10 ciudades, no solo en una. Este patrón es
+consistente con una práctica conocida de Airbnb: fijar un precio disparatado para
+bloquear el calendario de disponibilidad en lugar de pausar el anuncio, en vez de un
+error de captura de datos. El umbral fijo de 2.000€ es solo exploratorio (penaliza de
+forma desigual a ciudades con escalas de precio muy distintas, como Istanbul frente a
+Sydney); para la variable definitiva se usa un umbral relativo por ciudad:
+
+```{r}
+#| label: precio-sospechoso
+
+listings <- listings %>%
+  group_by(city) %>%
+  mutate(
+    q1 = quantile(price_eur, 0.25),
+    q3 = quantile(price_eur, 0.75),
+    iqr = q3 - q1,
+    umbral_outlier = q3 + 3 * iqr
+  ) %>%
+  ungroup() %>%
+  mutate(precio_sospechoso = price_eur > umbral_outlier & is.na(review_scores_rating))
+
+listings %>% filter(precio_sospechoso) %>% count(city, sort = TRUE)
+
+listings %>%
+  summarise(
+    n_total = n(),
+    n_sospechosos = sum(precio_sospechoso),
+    pct = round(100 * mean(precio_sospechoso), 2)
+  )
+
+# q1/q3/iqr/umbral_outlier eran solo intermedias para calcular precio_sospechoso;
+# se descartan para no arrastrarlas al resto del pipeline
+listings <- listings %>% select(-q1, -q3, -iqr, -umbral_outlier)
+```
+
+**Decisión:** se conserva `precio_sospechoso` como variable indicadora (no se eliminan
+filas del dataset general). Estos 6.471 casos (2,31% del total) se **excluirán del
+entrenamiento del modelo de regresión de precio** por no reflejar un precio de mercado
+real, pero se mantienen en el dataset para el resto de análisis. Se documenta como
+hallazgo cualitativo de interés para la parte del sponsor de la memoria.
+
+```{r}
+#| label: precio-sospechoso-plot
+#| fig-cap: "Listings con precio_sospechoso resaltados sobre la distribución general"
+
+ggplot(listings, aes(x = price_eur, fill = precio_sospechoso)) +
+  geom_histogram(bins = 100) +
+  scale_x_log10() +
+  labs(title = "price_eur: distribución general vs. casos marcados como precio_sospechoso",
+       x = "price_eur (log)", y = "nº de listings", fill = "Precio sospechoso")
+```
+
+# 3. Tratamiento de nulos
+
+## 3.1 `review_scores_*`
+
+Las 7 variables de puntuación (`rating` + 6 subpuntuaciones) están fuertemente
+correlacionadas en su missingness: la inmensa mayoría de los nulos corresponde a
+listings sin reseñas todavía, no a datos perdidos por error.
+
+```{r}
+#| label: has-reviews
+
+listings <- listings %>%
+  mutate(has_reviews = !is.na(review_scores_rating))
+```
+
+Antes de decidir cómo imputar, se identifican los casos con `rating` presente pero
+alguna subpuntuación ausente (un problema distinto al de los listings sin reviews):
+
+```{r}
+#| label: casos-parciales-review-scores
+
+listings %>%
+  filter(!is.na(review_scores_rating) &
+         (is.na(review_scores_accuracy) | is.na(review_scores_cleanliness) |
+          is.na(review_scores_checkin) | is.na(review_scores_communication) |
+          is.na(review_scores_location) | is.na(review_scores_value))) %>%
+  select(starts_with("review_scores")) %>%
+  rename_with(~ str_remove(.x, "review_scores_")) %>%
+  vis_miss()
+```
+
+Estos casos (`rating` presente, alguna subpuntuación ausente) se imputan con la media
+de las demás subpuntuaciones de la misma fila (mismo listing, misma escala 0-10). Dentro
+de ese grupo puede haber un subgrupo residual sin ninguna subpuntuación disponible
+(la media de fila no tendría con qué calcularse); se comprueba antes de aplicar la
+imputación:
+
+```{r}
+#| label: subgrupo-sin-subpuntuaciones
+
+score_cols <- c("review_scores_accuracy", "review_scores_cleanliness",
+                 "review_scores_checkin", "review_scores_communication",
+                 "review_scores_location", "review_scores_value")
+
+listings %>%
+  filter(has_reviews) %>%
+  rowwise() %>%
+  mutate(todas_na = all(is.na(c_across(all_of(score_cols))))) %>%
+  ungroup() %>%
+  summarise(n_casos = sum(todas_na))
+```
+
+Para ese subgrupo residual (el `n_casos` del resultado anterior) se aplica un
+*fallback* a la mediana global de cada subpuntuación (calculada solo entre listings
+con reviews), ya que no hay información dentro de la propia fila para imputar:
+
+```{r}
+#| label: imputacion-review-scores
+
+listings <- listings %>%
+  rowwise() %>%
+  mutate(
+    media_fila_scores = mean(c_across(all_of(score_cols)), na.rm = TRUE),
+    across(all_of(score_cols), ~ if_else(is.na(.x) & has_reviews, media_fila_scores, .x))
+  ) %>%
+  ungroup() %>%
+  select(-media_fila_scores) %>%
+  mutate(across(
+    all_of(score_cols),
+    ~ if_else(is.nan(.x) | (is.na(.x) & has_reviews),
+              median(.x[has_reviews], na.rm = TRUE),
+              .x)
+  ))
+
+# Verificación: solo deben quedar NA los listings sin reviews
+listings %>% summarise(across(all_of(score_cols), ~sum(is.na(.x))))
+```
+
+El resultado (91.264 nulos en las 6 columnas) es algo menor que el número de listings
+sin `has_reviews`. Se investiga la diferencia antes de asumir que es un error de la
+imputación:
+
+```{r}
+#| label: diagnostico-review-scores
+
+# 1. ¿Cuántas filas tienen has_reviews == FALSE en el dataset actual?
+listings %>% summarise(n_sin_reviews = sum(!has_reviews))
+
+# 2. ¿Hay filas con has_reviews == FALSE que sí tengan valor en alguna
+#    de las 6 columnas? (si diera > 0 en algún caso ajeno al esperado, sería un bug)
+listings %>%
+  filter(!has_reviews) %>%
+  summarise(across(all_of(score_cols), ~sum(!is.na(.x))))
+```
+
+**Diagnóstico:** hay 91.292 listings sin `has_reviews`, pero 28 de ellos tienen valores
+reales en las 6 subpuntuaciones pese a no tener `rating` — es decir, `has_reviews`
+(definida solo a partir de `rating`) no captura correctamente esos 28 casos, que
+mantienen su información original intacta porque la condición de imputación
+(`is.na(.x) & has_reviews`) nunca los tocó. La cuenta cuadra exactamente:
+91.292 − 28 = 91.264, el valor observado. No hay ningún error en la imputación.
+
+**Limitación conocida y documentada:** existen esos 28 casos donde `has_reviews == FALSE`
+(por ausencia de `rating`) pero sí hay valores reales en las subpuntuaciones — una
+inconsistencia residual del propio dataset (0,01% de las filas). Dado su volumen
+despreciable, se decide no aplicar un tratamiento especial y documentarlo como
+limitación conocida, en vez de redefinir `has_reviews`.
+
+## 3.2 `bedrooms`
+
+```{r}
+#| label: bedrooms-relacion
+#| fig-cap: "Mediana de bedrooms según accommodates"
+
+listings %>%
+  group_by(accommodates) %>%
+  summarise(
+    n = n(),
+    pct_na_bedrooms = round(100 * mean(is.na(bedrooms)), 1),
+    mediana_bedrooms = median(bedrooms, na.rm = TRUE)
+  ) %>%
+  print(n = Inf)
+
+listings %>%
+  filter(!is.na(bedrooms)) %>%
+  group_by(accommodates) %>%
+  summarise(mediana_bedrooms = median(bedrooms)) %>%
+  ggplot(aes(x = accommodates, y = mediana_bedrooms)) +
+  geom_line() + geom_point() +
+  labs(title = "Relación entre accommodates y bedrooms (mediana)",
+       x = "accommodates", y = "bedrooms (mediana)")
+```
+
+`bedrooms` (10,5% nulo) correlaciona claramente con `accommodates`, por lo que se
+imputa por la mediana dentro de cada grupo de `accommodates` en vez de una mediana
+global.
+
+```{r}
+#| label: imputacion-bedrooms
+
+listings <- listings %>%
+  group_by(accommodates) %>%
+  mutate(bedrooms = if_else(is.na(bedrooms), median(bedrooms, na.rm = TRUE), bedrooms)) %>%
+  ungroup()
+
+sum(is.na(listings$bedrooms))
+```
+
+## 3.3 `host_response_rate` / `host_acceptance_rate`
+
+Con un 40-46% de nulos, imputar introduciría demasiado ruido, y es plausible que la
+ausencia sea informativa en sí misma (un anfitrión sin historial de respuesta no tiene
+una "tasa" que imputar). Se comprobó si ambas variables faltan siempre juntas:
+
+```{r}
+#| label: host-rates-patron
+
+listings <- listings %>%
+  mutate(
+    has_response_rate = !is.na(host_response_rate),
+    has_acceptance_rate = !is.na(host_acceptance_rate)
+  )
+
+listings %>%
+  summarise(
+    solo_response_na = sum(is.na(host_response_rate) & !is.na(host_acceptance_rate)),
+    solo_acceptance_na = sum(!is.na(host_response_rate) & is.na(host_acceptance_rate)),
+    ambas_na = sum(is.na(host_response_rate) & is.na(host_acceptance_rate))
+  )
+
+# host_response_time coincide exactamente con la ausencia de host_response_rate
+listings %>%
+  summarise(coincide = sum(is.na(host_response_rate) == is.na(host_response_time)))
+```
+
+**Resultado:** aunque la mayoría de nulos coinciden (97.104 filas), hay divergencia
+real (31.597 + 15.918 filas donde solo una de las dos está ausente) — son señales
+relacionadas pero no idénticas. Se mantienen **dos variables indicadoras separadas**,
+sin fusionarlas. `host_response_time` coincide exactamente con `host_response_rate` y
+no requiere indicador propio.
+
+# 4. Feature engineering de `amenities`
+
+```{r}
+#| label: amenities-parseo
+
+listings <- listings %>%
+  mutate(amenities_list = map(amenities, ~ {
+    x <- fromJSON(.x)
+    if (length(x) == 0) character(0) else as.character(x)
+  }),
+  n_amenities = map_int(amenities_list, length))
+
+summary(listings$n_amenities)
+```
+
+```{r}
+#| label: amenities-frecuencia
+#| fig-cap: "Amenities más frecuentes en el dataset"
+#| fig-width: 8
+#| fig-height: 7
+
+amenities_freq <- listings %>%
+  select(listing_id, amenities_list) %>%
+  unnest(amenities_list) %>%
+  count(amenities_list, sort = TRUE)
+
+nrow(amenities_freq)
+
+amenities_freq %>%
+  slice_max(n, n = 20) %>%
+  ggplot(aes(x = reorder(amenities_list, n), y = n)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Top 20 amenities más frecuentes", x = NULL, y = "nº de listings")
+```
+
+Con 3.270 amenities distintas (mucho texto libre y variantes de producto), no tiene
+sentido crear una variable por cada una. Se seleccionan variables booleanas por
+familia (agrupando variantes vía regex, no valores exactos) combinando frecuencia
+suficiente y relevancia de negocio. Se descartan por ser demasiado universales y poco
+discriminantes `Essentials`, `Kitchen` y `Long term stays allowed` (todas por encima
+del 86% de prevalencia, ver top-20 arriba) — no se les crea variable propia. `Wifi`
+(93,5%), aun siendo también muy prevalente, sí se conserva como variable por su
+relevancia directa para el objetivo del proyecto.
+
+```{r}
+#| label: amenities-booleanas
+
+listings <- listings %>%
+  mutate(
+    has_wifi = str_detect(amenities, regex("wifi", ignore_case = TRUE)),
+    has_ac = str_detect(amenities, regex("air conditioning", ignore_case = TRUE)),
+    has_pool = str_detect(amenities, regex("\\bpool\\b", ignore_case = TRUE)),
+    has_gym = str_detect(amenities, regex("gym|fitness", ignore_case = TRUE)),
+    has_hot_tub = str_detect(amenities, regex("hot tub|jacuzzi", ignore_case = TRUE)),
+    has_fireplace = str_detect(amenities, regex("fireplace", ignore_case = TRUE)),
+    has_bbq = str_detect(amenities, regex("bbq grill|\\bgrill\\b(?! seulement| microwave)", ignore_case = TRUE)),
+    has_beach_access = str_detect(amenities, regex("beachfront|waterfront|\\bbeach\\b", ignore_case = TRUE)),
+    has_elevator = str_detect(amenities, regex("elevator", ignore_case = TRUE)),
+    has_dishwasher = str_detect(amenities, regex("dishwasher", ignore_case = TRUE)),
+    has_private_entrance = str_detect(amenities, regex("private entrance", ignore_case = TRUE)),
+    has_free_parking = str_detect(amenities, regex("free parking", ignore_case = TRUE)),
+    has_patio_balcony = str_detect(amenities, regex("patio or balcony", ignore_case = TRUE)),
+    has_ev_charger = str_detect(amenities, regex("ev charger", ignore_case = TRUE)),
+    has_view = str_detect(amenities, regex(" view", ignore_case = TRUE))
+  )
+
+listings %>%
+  summarise(across(starts_with("has_"), ~round(100*mean(.x), 1))) %>%
+  pivot_longer(everything(), names_to = "amenity", values_to = "pct") %>%
+  arrange(desc(pct))
+```
+
+`has_view` sale con 0,0% de prevalencia redondeada — se comprueba la cifra exacta antes
+de decidir si se conserva o se descarta:
+
+```{r}
+#| label: has-view-check
+
+sum(listings$has_view)
+```
+
+Con solo **6 casos** sobre 279.599 filas (el único término relacionado presente en el
+dataset es `Mountain view`), `has_view` no aporta capacidad predictiva real. Se descarta:
+
+```{r}
+#| label: descartar-has-view
+
+listings <- listings %>% select(-has_view)
+```
+
+`amenities_list` (la lista parseada) ya cumplió su función para extraer `n_amenities`
+y las variables `has_*` — se elimina antes de seguir, porque al ser una *list-column*
+(cada celda contiene un vector, no un valor simple) no se puede exportar correctamente
+a CSV ni se representa bien en los gráficos de missingness:
+
+```{r}
+#| label: descartar-amenities-list
+
+listings <- listings %>% select(-amenities_list)
+```
+
+# 5. EDA post-limpieza (validación visual)
+
+Se repite el bloque de missingness y distribución de precio sobre el dataset ya
+limpio, como evidencia visual de que el proceso de limpieza funcionó:
+
+```{r}
+#| label: eda-post-missingness
+#| fig-cap: "Valores ausentes por variable (dataset limpio, solo variables con nulos)"
+#| fig-width: 8
+#| fig-height: 5
+
+miss_var_summary(listings) %>% print(n = Inf)
+
+# Con el número de columnas ya añadidas (has_*, price_eur, etc.), pintar todas las
+# variables en gg_miss_var/vis_miss satura el gráfico y la mayoría tienen 0 nulos.
+# Se restringe a las que de verdad conservan algún nulo, que es lo relevante aquí.
+cols_con_nulos <- listings %>%
+  summarise(across(everything(), ~sum(is.na(.x)))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "n_na") %>%
+  filter(n_na > 0) %>%
+  pull(variable)
+
+gg_miss_var(listings %>% select(all_of(cols_con_nulos))) +
+  labs(title = "Valores ausentes por variable (después de limpieza)")
+
+vis_miss(listings %>% select(all_of(cols_con_nulos)), warn_large_data = FALSE) +
+  theme(plot.margin = margin(t = 40, r = 10, b = 10, l = 10))
+```
+
+Tras la limpieza, los únicos nulos que quedan son los estructurales y
+deliberadamente no imputados: `district` (solo aplica a New York), `review_scores_*`
+para listings sin reviews, y `host_response_rate`/`host_acceptance_rate`/
+`host_response_time` para anfitriones sin historial — todos ellos ya cubiertos por sus
+variables indicadoras (`has_reviews`, `has_response_rate`, `has_acceptance_rate`).
+`bedrooms` aparece con 0 nulos.
+
+```{r}
+#| label: eda-post-price
+#| fig-cap: "Distribución de price_eur después de la limpieza"
+#| fig-width: 10
+#| fig-height: 8
+
+listings %>%
+  summarise(
+    n = n(),
+    min = min(price_eur),
+    mediana = median(price_eur),
+    max = max(price_eur)
+  )
+
+ggplot(listings, aes(x = price_eur)) +
+  geom_histogram(bins = 100) +
+  scale_x_log10() +
+  labs(title = "Distribución de price_eur (dataset limpio, moneda común)",
+       x = "price_eur (log)", y = "nº de listings")
+
+# Contraste directo: price (moneda local, antes) vs. price_eur (moneda común, después)
+ggplot(listings, aes(x = price_eur, fill = precio_sospechoso)) +
+  geom_histogram(bins = 100) +
+  scale_x_log10() +
+  facet_wrap(~city, scales = "free_y", ncol = 3) +
+  labs(title = "price_eur por ciudad, con precio_sospechoso resaltado",
+       x = "price_eur (log)", y = "nº de listings", fill = "Precio sospechoso")
+```
+
+La comparación con la sección 1.5 (distribución de `price` en moneda local, sin
+convertir) muestra el efecto de la conversión de moneda: todas las ciudades quedan
+ahora en una escala comparable, y los casos de `precio_sospechoso` se concentran en la
+cola derecha de cada distribución, tal como se esperaba de su definición (Q3 + 3×IQR
+por ciudad).
+
+# 6. Guardado del dataset limpio
+
+El dataset limpio queda con **279.599 filas** (las 279.712 originales menos los 113
+casos de `price = 0` descartados en la sección 2) y las variables originales más las
+añadidas en este documento (`price_eur`, `precio_sospechoso`, `has_reviews`,
+`has_response_rate`, `has_acceptance_rate`, `n_amenities` y las `has_*` de amenities).
+
+```{r}
+#| label: guardado
+
+write_csv(listings, "data/listings_clean.csv")
+```
