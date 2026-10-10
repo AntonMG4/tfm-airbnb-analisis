@@ -1,0 +1,336 @@
+---
+title: "TFM - Sistema de optimización de precios y segmentación de mercado en Airbnb"
+subtitle: "Fase ETL: extracción, transformación y carga de datos - reviews.csv"
+author: "Antón Maestre Gómez"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    theme: cosmo
+execute:
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+
+library(tidyverse)
+```
+
+# Introducción
+
+Este documento recoge la fase de ETL de `reviews.csv`, en paralelo al ETL de
+`listings.csv`. El objetivo es dejar un dataset
+de reseñas limpio y una agregación temporal por listing/mes, necesaria para el
+componente de estacionalidad del proyecto.
+
+# 1. Carga y calidad de datos
+
+## 1.1 Carga
+
+```{r}
+#| label: carga
+
+reviews <- read_csv("data/reviews.csv", show_col_types = FALSE)
+listings <- read_csv("data/listings_clean.csv", show_col_types = FALSE)
+```
+
+## 1.2 Estructura general
+
+```{r}
+#| label: estructura
+
+glimpse(reviews)
+nrow(reviews)
+```
+
+`reviews.csv` contiene **5.373.143 filas y 4 columnas** (`listing_id`, `review_id`,
+`date`, `reviewer_id`), en línea con lo indicado en la documentación del dataset
+(~5 millones de registros).
+
+## 1.3 Nulos y fechas
+
+```{r}
+#| label: nulos-fechas
+
+reviews %>%
+  summarise(across(everything(), ~sum(is.na(.x))))
+
+reviews %>%
+  summarise(
+    min_date = min(date, na.rm = TRUE),
+    max_date = max(date, na.rm = TRUE),
+    n_date_na = sum(is.na(date))
+  )
+```
+
+Sin nulos en ninguna columna, y `date` parsea correctamente en un rango 2008-11-16 a
+2021-03-01, consistente con el periodo del dataset (2008-2021).
+
+## 1.4 Duplicados de `review_id`
+
+Cada reseña debería tener un `review_id` único. Se comprueba si hay duplicados y, de
+haberlos, si son filas idénticas repetidas o el mismo ID usado para registros
+distintos:
+
+```{r}
+#| label: duplicados-review-id
+
+reviews %>%
+  count(review_id, sort = TRUE) %>%
+  filter(n > 1)
+
+# ¿Son duplicados exactos o el mismo review_id con datos distintos?
+reviews %>%
+  add_count(review_id) %>%
+  filter(n > 1) %>%
+  arrange(review_id) %>%
+  distinct(review_id, listing_id, date, reviewer_id) %>%
+  count(review_id) %>%
+  count(n, name = "n_review_ids")
+```
+
+Hay **160 `review_id` duplicados**, y en todos los casos las dos filas difieren en
+`listing_id` (no son duplicados exactos). Se investiga el patrón antes de decidir el
+tratamiento:
+
+```{r}
+#| label: investigacion-duplicados
+
+reviews %>%
+  add_count(review_id) %>%
+  filter(n > 1) %>%
+  arrange(review_id, date) %>%
+  select(review_id, listing_id, date, reviewer_id) %>%
+  print(n = 30)
+
+# ¿El emparejamiento de listing_id es consistente, o hay mezclas aleatorias?
+pares_duplicados <- reviews %>%
+  add_count(review_id) %>%
+  filter(n > 1) %>%
+  group_by(review_id) %>%
+  summarise(par = paste(sort(unique(listing_id)), collapse = "-")) %>%
+  count(par, sort = TRUE)
+
+print(pares_duplicados, n = Inf)
+
+# ¿Ambos listing_id de cada pareja corresponden al mismo alojamiento físico?
+ids_pares <- pares_duplicados %>%
+  separate(par, into = c("id1", "id2"), sep = "-", convert = TRUE)
+
+listings %>%
+  filter(listing_id %in% c(ids_pares$id1, ids_pares$id2)) %>%
+  select(listing_id, host_id, latitude, longitude, name, city) %>%
+  arrange(listing_id) %>%
+  print(n = 30)
+```
+
+**Hallazgo:** los 160 `review_id` duplicados corresponden a **11 propiedades en Roma**
+(mismas coordenadas exactas, mismo nombre salvo variaciones tipográficas menores),
+publicadas primero bajo un `host_id` y después re-publicadas bajo un `host_id`
+distinto — consistente con una migración de cuenta del anfitrión. Durante la
+transición, algunas reseñas quedaron asociadas con el mismo `review_id` a ambos
+`listing_id` del mismo alojamiento. Es un patrón identificado y explicable, no ruido
+aleatorio, y afecta a un volumen ínfimo (160 de 5.373.143 filas, 0,003%).
+
+# 2. Deduplicación de `review_id`
+
+Se conserva una única fila por `review_id`, quedándonos con el `listing_id` más
+reciente de cada pareja (el ID vigente tras la migración). "Más reciente" se traduce
+aquí en el `listing_id` de mayor valor numérico, ya que Airbnb asigna estos IDs de
+forma creciente en el momento de creación del anuncio — el ID más alto de la pareja es,
+por tanto, el publicado después de la migración:
+
+```{r}
+#| label: deduplicacion
+
+reviews <- reviews %>%
+  group_by(review_id) %>%
+  slice_max(listing_id, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+nrow(reviews)
+```
+
+El resultado (5.372.983) coincide exactamente con 5.373.143 − 160, confirmando que la
+deduplicación eliminó únicamente los casos identificados, sin afectar al resto.
+
+# 3. Integridad referencial con `listings.csv`
+
+Con `reviews` ya deduplicado, se comprueba la correspondencia de `listing_id` entre
+ambos datasets:
+
+```{r}
+#| label: integridad-referencial
+
+# ¿Cuántos listing_id de reviews NO existen en listings?
+reviews %>%
+  filter(!listing_id %in% listings$listing_id) %>%
+  summarise(n = n(), pct = round(100 * n() / nrow(reviews), 4))
+
+# ¿Cuántos listings no tienen ninguna reseña en reviews.csv?
+listings %>%
+  filter(!listing_id %in% reviews$listing_id) %>%
+  summarise(n = n(), pct = round(100 * n() / nrow(listings), 2))
+```
+
+Todos los `listing_id` de `reviews.csv` existen en `listings.csv` (0 huérfanos). Hay
+**86.043 listings (30,8%) sin ninguna reseña** en `reviews.csv`.
+
+## 3.1 Contraste con `has_reviews`
+
+En `listings_clean.csv`, la variable `has_reviews` (basada en `review_scores_rating`)
+marca 91.292 listings sin reviews — una cifra distinta a los 86.043 sin ninguna fila en
+`reviews.csv`. La diferencia no es una simple resta (91.292 − 86.043 = 5.249): al
+calcularla directamente sobre los datos (no por diferencia de totales), da **5.250
+casos** — señal de que los dos conjuntos no son subconjuntos exactos entre sí. Se
+investiga antes de asumir una causa:
+
+```{r}
+#| label: diagnostico-huerfanos
+
+resumen_huerfanos <- listings %>%
+  filter(has_reviews == FALSE, listing_id %in% reviews$listing_id) %>%
+  select(listing_id) %>%
+  left_join(
+    reviews %>% group_by(listing_id) %>% summarise(n_reviews = n(), ultima_review = max(date)),
+    by = "listing_id"
+  )
+
+resumen_huerfanos %>%
+  summarise(n_casos = n(), mediana_n_reviews = median(n_reviews), max_n_reviews = max(n_reviews))
+
+# Distribución completa de n_reviews
+resumen_huerfanos %>%
+  summarise(
+    p50 = quantile(n_reviews, 0.5), p75 = quantile(n_reviews, 0.75),
+    p90 = quantile(n_reviews, 0.9), p99 = quantile(n_reviews, 0.99),
+    max = max(n_reviews)
+  )
+
+# ¿Estos casos se concentran cerca del final del periodo del dataset? (hipótesis de
+# desfase temporal entre listings.csv y reviews.csv)
+resumen_huerfanos %>%
+  summarise(
+    min_ultima_review = min(ultima_review),
+    mediana_ultima_review = median(ultima_review),
+    max_ultima_review = max(ultima_review)
+  )
+```
+
+**Conclusión:** el 90% de estos 5.250 casos tiene 1-2 reseñas (p99 = 3), y la mediana
+de su última reseña (2018-07-24) está lejos del límite superior del dataset
+(2021-03-01) — descarta el desfase temporal como explicación. El patrón encaja con el
+comportamiento conocido de Airbnb de no publicar una puntuación agregada hasta
+acumular un mínimo de reseñas (habitualmente 3). Es un hallazgo de negocio, no un
+error de datos.
+
+# 4. Agregación temporal
+
+## 4.1 Por `listing_id` + mes
+
+```{r}
+#| label: agregacion-mensual
+
+reviews_mensual <- reviews %>%
+  mutate(anio_mes = floor_date(date, unit = "month")) %>%
+  count(listing_id, anio_mes, name = "n_reviews_mes")
+
+glimpse(reviews_mensual)
+```
+
+Se agrega a nivel `listing_id` + mes (no por día, ni a nivel global) porque es la
+granularidad que necesitan los dos análisis siguientes: la evolución temporal global
+(4.2) y la estacionalidad por ciudad (4.3). El modelo de precio también necesita una
+variable de actividad de reseñas por listing, pero no reutilizará esta agregación: se
+calculará de forma independiente en el clustering, directamente sobre `reviews_clean.csv`
+sin el filtro de meses finales de la sección 4.2 — ese filtro tiene sentido para no
+confundir el corte del dataset con una caída de demanda real en una gráfica agregada,
+pero no para contar la actividad de un listing individual, donde esos últimos meses son
+reseñas reales que sí deben contarse.
+
+## 4.2 Evolución temporal global
+
+`reviews.csv` termina en 2021-03-01, y las reseñas se escriben con retraso respecto a
+la estancia — los últimos meses del dataset están necesariamente incompletos (censura
+por la derecha). Se excluyen antes de analizar la tendencia, para no confundir ese
+artefacto de recolección con una caída de demanda real:
+
+```{r}
+#| label: filtro-censura
+#| fig-cap: "Nº de reseñas por mes (todas las ciudades, hasta dic-2020)"
+#| fig-width: 8
+#| fig-height: 5
+
+reviews_mensual_filtrado <- reviews_mensual %>%
+  filter(anio_mes < as.Date("2021-01-01"))
+
+reviews_mensual_filtrado %>%
+  group_by(anio_mes) %>%
+  summarise(n_reviews_mes = sum(n_reviews_mes)) %>%
+  ggplot(aes(x = anio_mes, y = n_reviews_mes)) +
+  geom_line() +
+  labs(title = "Nº de reseñas por mes (todas las ciudades, hasta dic-2020)",
+       x = NULL, y = "nº de reseñas")
+```
+
+Se observa un crecimiento sostenido hasta 2019, y la caída abrupta de 2020 asociada al
+impacto de la pandemia en el turismo, con recuperación parcial hacia finales de año —
+sin el artefacto de truncamiento que aparecía al incluir los meses finales del dataset.
+
+## 4.3 Cruce geográfico y estacionalidad por ciudad
+
+```{r}
+#| label: estacionalidad-ciudad
+#| fig-cap: "Estacionalidad de reseñas por ciudad (promedio mensual histórico, hasta dic-2019)"
+#| fig-width: 9
+#| fig-height: 7
+
+reviews_mensual_ciudad <- reviews_mensual_filtrado %>%
+  left_join(listings %>% select(listing_id, city), by = "listing_id") %>%
+  group_by(city, anio_mes) %>%
+  summarise(n_reviews_mes = sum(n_reviews_mes), .groups = "drop")
+
+# Verificación: no debería haber ningún listing_id sin match en listings
+reviews_mensual_ciudad %>% filter(is.na(city)) %>% summarise(n = n())
+
+# Se excluye 2020 por la caída por la pandemia 
+reviews_mensual_ciudad %>%
+  filter(anio_mes < as.Date("2020-01-01")) %>%
+  mutate(mes = month(anio_mes, label = TRUE)) %>%
+  group_by(city, mes) %>%
+  summarise(media_reviews = mean(n_reviews_mes), .groups = "drop") %>%
+  ggplot(aes(x = mes, y = media_reviews, group = city)) +
+  geom_line(color = "steelblue") +
+  facet_wrap(~city, scales = "free_y") +
+  labs(title = "Estacionalidad de reseñas por ciudad\n(promedio mensual histórico, hasta dic-2019)",
+       x = NULL, y = "media de reseñas/mes") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 7))
+```
+
+**Hallazgo:** se excluye 2020 del promedio porque la caída de actividad por la pandemia a partir de marzo inflaría artificialmente enero y febrero frente al resto de meses (con 2020 incluido, el pico de enero de Sydney, Rio y Bangkok aparecía exagerado). Con los datos hasta dic-2019, el patrón estacional depende claramente de la ubicación de cada ciudad:
+
+- **Hemisferio sur (Sydney, Cape Town, Rio de Janeiro):** patrón invertido respecto al norte — valle en mayo (su otoño) y máxima actividad entre noviembre y enero (su verano).
+- **Hemisferio norte templado (Paris, Rome, New York, Istanbul):** mínimo en invierno (ene-feb) y actividad concentrada entre primavera y otoño, con el máximo en octubre; Paris y Rome muestran además un descenso en agosto.
+- **Ciudades tropicales:** siguen su propio calendario — Bangkok concentra la actividad entre noviembre y enero con un segundo repunte en julio, Mexico City presenta dos picos (marzo y noviembre) y Hong Kong no muestra un patrón definido.
+
+Como las reseñas se publican después de la estancia, su pico se desplaza ligeramente respecto al de ocupación. El hallazgo no se usa como variable del modelo (el dataset tiene un único precio por alojamiento), pero es relevante para la gestión de precios: las temporadas altas no coinciden entre mercados. Se documenta como resultado para la memoria.
+
+# 5. Guardado de datasets limpios
+
+Se guarda un único fichero, `reviews_clean.csv` (el dataset de reseñas deduplicado, a
+nivel de reseña individual).
+`reviews_mensual_filtrado` y `reviews_mensual_ciudad` (secciones 4.1-4.3) no se
+guardan aparte: son agregaciones calculadas para los análisis de este propio
+documento, no una entrada reutilizable de las fases siguientes — el clustering
+recalculará la actividad de reseñas por listing directamente desde `reviews_clean.csv`. Los hallazgos de tendencia y estacionalidad quedan documentados aquí
+mismo y se recuperan desde este análisis para la memoria.
+
+```{r}
+#| label: guardado
+
+write_csv(reviews, "data/reviews_clean.csv")
+```
